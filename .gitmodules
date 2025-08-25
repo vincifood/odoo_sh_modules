@@ -4,3 +4,6 @@
 [submodule "vinci_food_route_planner"]
 	path = vinci_food_route_planner
 	url = git@github.com:vis-marin-bilisim/vinci_food_route_planner.git
+[submodule "vinci_landed_cost_ext"]
+	path = vinci_landed_cost_ext
+	url = https://github.com/vis-marin-bilisim/vinci_landed_cost_ext.git
