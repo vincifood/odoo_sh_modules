@@ -7,3 +7,6 @@
 [submodule "vinci_landed_cost_ext"]
 	path = vinci_landed_cost_ext
 	url = git@github.com:vis-marin-bilisim/vinci_landed_cost_ext.git
+[submodule "vinci_food_replenishment_planning"]
+	path = vinci_food_replenishment_planning
+	url = git@github.com:vis-marin-bilisim/vinci_food_replenishment_planning
