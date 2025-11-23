@@ -13,3 +13,6 @@
 [submodule "vinci_food_promotion"]
 	path = vinci_food_promotion
 	url = git@github.com:vis-marin-bilisim/vinci_food_promotion.git
+[submodule "vinci_custom_invoice_template"]
+	path = vinci_custom_invoice_template
+	url = git@github.com:mikailboke/vinci_custom_invoice_template.git
