@@ -16,3 +16,6 @@
 [submodule "vinci_custom_invoice_template"]
 	path = vinci_custom_invoice_template
 	url = git@github.com:mikailboke/vinci_custom_invoice_template.git
+[submodule "vinci_sales_prediction"]
+	path = vinci_sales_prediction
+	url = git@github.com:vis-marin-bilisim/vinci_sales_prediction.git
