@@ -11,7 +11,14 @@ links and business rules are verified in a test database.
     "category": "Sales",
     "author": "Vinci Food - Onur Deniz",
     "license": "LGPL-3",
-    "depends": ["sale_management", "purchase", "stock", "account"],
+    "depends": [
+        "sale_management",
+        "purchase",
+        "stock",
+        "account",
+        "sale_purchase_inter_company_rules",
+        "vinci_food_route_planner",
+    ],
     "data": [
         "security/ir.model.access.csv",
         "wizard/intercompany_order_review_wizard_views.xml",
