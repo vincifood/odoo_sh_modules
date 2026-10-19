@@ -15,18 +15,40 @@ class SaleOrder(models.Model):
         "company_id.is_central_company",
         "company_id.vinci_intercompany_management_enabled",
         "auto_purchase_order_id",
+        "auto_purchase_order_id.auto_sale_order_id",
+        "auto_purchase_order_id.auto_sale_order_id.order_type",
     )
+
     def _compute_vinci_can_review_intercompany(self):
         for order in self:
             central_company = order.company_id
             purchase_order = order.auto_purchase_order_id
 
+            counterpart_order = (
+                purchase_order.auto_sale_order_id
+                if purchase_order
+                else self.env["sale.order"]
+            )
+
+            # Some mobile API orders have no explicit SO link.
+            if (
+                purchase_order
+                and not counterpart_order
+                and purchase_order.origin
+            ):
+                counterpart_order = self.env["sale.order"].search([
+                    ("name", "=", purchase_order.origin),
+                    ("company_id", "=", purchase_order.company_id.id),
+                ], limit=2)
+
             order.vinci_can_review_intercompany = bool(
                 central_company.is_central_company
                 and central_company.vinci_intercompany_management_enabled
                 and purchase_order
+                and len(counterpart_order) == 1
+                and counterpart_order.order_type == "cold_sale"
             )
- 
+
     def _vinci_get_intercompany_document_summary(self):
         """Find linked intercompany documents without modifying them."""
         self.ensure_one()
@@ -94,6 +116,15 @@ class SaleOrder(models.Model):
 
         if counterpart_orders.company_id != distributor_company:
             raise UserError(_("The linked sales order belongs to another company."))
+
+        # Only Cold Sale orders are supported.
+        # Hot Sale and other order types must never be revised or cancelled.
+        if counterpart_orders.order_type != "cold_sale":
+            raise UserError(_(
+                "Intercompany revision and cancellation are only allowed "
+                "for Cold Sale orders. The linked distributor sales order "
+                "is not a Cold Sale."
+            ))
 
         if (
             purchase_order.origin
@@ -169,4 +200,3 @@ class SaleOrder(models.Model):
             "res_id": wizard.id,
             "target": "new",
         }
-    
