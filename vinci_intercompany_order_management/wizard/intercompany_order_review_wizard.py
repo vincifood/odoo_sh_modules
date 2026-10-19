@@ -30,6 +30,12 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
         "wizard_id", "picking_id", string="Related Transfers / Returns", readonly=True
     )
 
+    revision_line_ids = fields.One2many(
+        "vinci.intercompany.revision.line",
+        "wizard_id",
+        string="Revision Lines",
+    )
+
     def action_confirm(self):
         self.ensure_one()
         operation_label = _("revision") if self.operation == "revision" else _("cancellation")

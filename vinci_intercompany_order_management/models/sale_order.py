@@ -13,13 +13,18 @@ class SaleOrder(models.Model):
     @api.depends(
         "company_id",
         "company_id.is_central_company",
+        "company_id.vinci_intercompany_management_enabled",
         "auto_purchase_order_id",
     )
     def _compute_vinci_can_review_intercompany(self):
         for order in self:
+            central_company = order.company_id
+            purchase_order = order.auto_purchase_order_id
+
             order.vinci_can_review_intercompany = bool(
-                order.company_id.is_central_company
-                and order.auto_purchase_order_id
+                central_company.is_central_company
+                and central_company.vinci_intercompany_management_enabled
+                and purchase_order
             )
  
     def _vinci_get_intercompany_document_summary(self):
@@ -49,8 +54,23 @@ class SaleOrder(models.Model):
         purchase_order = self.auto_purchase_order_id
         distributor_company = purchase_order.company_id
 
+        if not (
+            central_company.vinci_intercompany_management_enabled
+            and distributor_company.vinci_intercompany_management_enabled
+        ):
+            raise UserError(_(
+                "Intercompany revision and cancellation are not enabled "
+                "for both companies."
+            ))
+
         if not distributor_company.is_distributor:
             raise UserError(_("The source PO does not belong to a distributor."))
+
+        if central_company.vinci_intercompany_managed_distributor_id != distributor_company:
+            raise UserError(_(
+                "This distributor is not authorized for intercompany "
+                "revision and cancellation with the central company."
+            ))
 
         if distributor_company.central_vendor_company_id != central_company:
             raise UserError(_(
@@ -105,9 +125,25 @@ class SaleOrder(models.Model):
         self.ensure_one()
         summary = self._vinci_get_intercompany_document_summary()
 
+        revision_lines = []
+
+        if operation == "revision":
+            for line in self.order_line:
+                if line.display_type or not line.product_id:
+                    continue
+
+                revision_lines.append((0, 0, {
+                    "sale_order_line_id": line.id,
+                    "product_id": line.product_id.id,
+                    "original_quantity": line.product_uom_qty,
+                    "new_quantity": line.product_uom_qty,
+                    "product_uom_id": line.product_uom.id,
+                }))
+
         wizard = self.env["vinci.intercompany.order.review.wizard"].create({
             "sale_order_id": self.id,
             "operation": operation,
+            "revision_line_ids": revision_lines,
             "purchase_order_ids": [
                 (6, 0, summary["purchase_orders"].ids)
             ],
