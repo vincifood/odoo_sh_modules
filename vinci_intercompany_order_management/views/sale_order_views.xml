@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_order_form_vinci_intercompany_management" model="ir.ui.view">
+        <field name="name">sale.order.form.vinci.intercompany.management</field>
+        <field name="model">sale.order</field>
+        <field name="inherit_id" ref="sale.view_order_form"/>
+
+        <field name="arch" type="xml">
+
+            <!-- Fields required for button visibility -->
+            <xpath expr="//sheet" position="inside">
+                <field name="auto_purchase_order_id" invisible="1"/>
+                <field name="vinci_can_review_intercompany" invisible="1"/>
+            </xpath>
+
+            <!-- Intercompany order management buttons -->
+            <xpath expr="//header" position="inside">
+
+                <button name="action_vinci_review_intercompany_revision"
+                        type="object"
+                        string="Revize Et ve Belgeleri Güncelle"
+                        class="btn-secondary"
+                        groups="sales_team.group_sale_salesman"
+                        invisible="not vinci_can_review_intercompany"/>
+
+                <button name="action_vinci_review_intercompany_cancellation"
+                        type="object"
+                        string="İptal Et ve Belgeleri Güncelle"
+                        class="btn-secondary"
+                        groups="sales_team.group_sale_manager"
+                        invisible="not vinci_can_review_intercompany"/>
+
+            </xpath>
+
+        </field>
+    </record>
+</odoo>
