@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_company_form_intercompany_management" model="ir.ui.view">
+        <field name="name">res.company.form.intercompany.management</field>
+        <field name="model">res.company</field>
+        <field name="inherit_id" ref="vinci_food_route_planner.view_company_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='central_vendor_company_id']" position="after">
+                <field name="vinci_intercompany_management_enabled"
+                        groups="base.group_system"/>
+                <field name="vinci_intercompany_managed_distributor_id"
+                        invisible="not is_central_company"
+                        groups="base.group_system"/>
+            </xpath>
+        </field>
+    </record>
+</odoo>

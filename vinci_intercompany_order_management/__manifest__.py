@@ -21,6 +21,7 @@ links and business rules are verified in a test database.
     ],
     "data": [
         "security/ir.model.access.csv",
+        "views/res_company_views.xml",
         "wizard/intercompany_order_review_wizard_views.xml",
         "views/sale_order_views.xml",
     ],
