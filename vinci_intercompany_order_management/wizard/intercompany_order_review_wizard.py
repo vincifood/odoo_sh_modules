@@ -1,5 +1,11 @@
+import logging
+
 from odoo import _, fields, models
 from odoo.exceptions import UserError
+from odoo.tools import float_compare
+from psycopg2 import errors
+
+_logger = logging.getLogger(__name__)
 
 
 class VinciIntercompanyOrderReviewWizard(models.TransientModel):
@@ -40,22 +46,32 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
         self.ensure_one()
 
         if self.operation == "revision":
-            result = self._vinci_validate_revision()
+            _logger.info(
+                "VINCI_INTERCOMPANY | REVISION_START | SO=%s | USER=%s",
+                self.sale_order_id.name,
+                self.env.user.id,
+            )
 
-            raise UserError(_(
-                "Revision validation successful.\n\n"
-                "Source Sales Order: %(so)s\n"
-                "Matched product lines: %(count)s\n\n"
-                "No documents have been modified yet.",
-                so=self.sale_order_id.name,
-                count=len(result["matches"]),
-            ))
+            try:
+                result = self._vinci_validate_revision()
+                self._vinci_apply_quantity_revision(result)
+            except Exception:
+                _logger.exception(
+                    "VINCI_INTERCOMPANY | REVISION_FAILED | SO=%s",
+                    self.sale_order_id.name,
+                )
+                raise
+
+            _logger.info(
+                "VINCI_INTERCOMPANY | REVISION_SUCCESS | SO=%s",
+                self.sale_order_id.name,
+            )
+
+            return {"type": "ir.actions.act_window_close"}
 
         if self.operation == "cancellation":
             self.sale_order_id._vinci_get_intercompany_document_summary()
-
             raise UserError(_(
-                "Cancellation document validation successful.\n\n"
                 "Cancellation is not implemented yet. "
                 "No documents have been modified."
             ))
@@ -221,3 +237,384 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
             })
 
         return matches
+
+
+    def _vinci_lock_revision_documents(self, summary):
+        self.ensure_one()
+
+        sale_orders = self.sale_order_id | summary["counterpart_orders"]
+        purchase_orders = summary["purchase_orders"]
+
+        pickings = summary["pickings"]
+        moves = pickings.move_ids
+
+        records_to_lock = [
+            ("sale_order", sorted(sale_orders.ids)),
+            ("purchase_order", sorted(purchase_orders.ids)),
+            ("sale_order_line", sorted(sale_orders.order_line.ids)),
+            ("purchase_order_line", sorted(purchase_orders.order_line.ids)),
+            ("stock_picking", sorted(pickings.ids)),
+            ("stock_move", sorted(moves.ids)),
+            ("stock_move_line", sorted(moves.move_line_ids.ids)),
+        ]
+
+        try:
+            with self.env.cr.savepoint():
+                for table_name, record_ids in records_to_lock:
+                    if not record_ids:
+                        continue
+
+                    self.env.cr.execute(
+                        f"SELECT id FROM {table_name} "
+                        "WHERE id = ANY(%s) ORDER BY id FOR UPDATE NOWAIT",
+                        (record_ids,),
+                    )
+
+                    _logger.info(
+                        "VINCI_INTERCOMPANY | DOCUMENT_LOCKED "
+                        "| TABLE=%s | IDS=%s",
+                        table_name,
+                        record_ids,
+                    )
+
+        except errors.LockNotAvailable:
+            _logger.warning(
+                "VINCI_INTERCOMPANY | DOCUMENT_LOCK_FAILED | SO=%s",
+                self.sale_order_id.name,
+            )
+            raise UserError(_(
+                "Another operation is currently updating these orders. "
+                "Please try again shortly."
+            ))
+
+        # Refresh cached ORM values after acquiring database locks.
+        self.env.invalidate_all()
+
+
+    def _vinci_apply_quantity_revision(self, result):
+        self.ensure_one()
+
+        summary = result["summary"]
+
+        # Save the document and stock move IDs before locking.
+        original_document_ids = {
+            "purchase_orders": set(summary["purchase_orders"].ids),
+            "counterpart_orders": set(summary["counterpart_orders"].ids),
+            "pickings": set(summary["pickings"].ids),
+            "moves": set(summary["pickings"].move_ids.ids),
+        }
+
+        self._vinci_lock_revision_documents(summary)
+
+        # Revalidate after acquiring the database locks.
+        result = self._vinci_validate_revision()
+        summary = result["summary"]
+        matches = result["matches"]
+
+        current_document_ids = {
+            "purchase_orders": set(summary["purchase_orders"].ids),
+            "counterpart_orders": set(summary["counterpart_orders"].ids),
+            "pickings": set(summary["pickings"].ids),
+            "moves": set(summary["pickings"].move_ids.ids),
+        }
+
+        if original_document_ids != current_document_ids:
+            _logger.warning(
+                "VINCI_INTERCOMPANY | DOCUMENT_LINKS_CHANGED | SO=%s",
+                self.sale_order_id.name,
+            )
+            raise UserError(_(
+                "Linked intercompany documents or stock moves changed "
+                "during the revision. Please reopen the wizard."
+            ))
+
+        all_moves = self.env["stock.move"]
+        updates = []
+
+        for match in matches:
+            central = match["central_line"]
+            purchase = match["purchase_line"]
+            distributor = match["distributor_line"]
+            new_qty = match["new_quantity"]
+
+            revision_line = self.revision_line_ids.filtered(
+                lambda line: line.sale_order_line_id == central
+            )
+
+            rounding = central.product_uom.rounding
+            old_qty = central.product_uom_qty
+
+            if len(revision_line) != 1:
+                raise UserError(_("Revision line mismatch."))
+
+            if float_compare(
+                old_qty,
+                revision_line.original_quantity,
+                precision_rounding=rounding,
+            ) != 0:
+                raise UserError(_(
+                    "The order quantity changed after opening the wizard. "
+                    "Please reopen the revision."
+                ))
+
+            for line_qty in (
+                purchase.product_qty,
+                distributor.product_uom_qty,
+            ):
+                if float_compare(
+                    line_qty, old_qty, precision_rounding=rounding
+                ) != 0:
+                    raise UserError(_(
+                        "Linked order quantities do not match."
+                    ))
+
+            # First implementation: positive quantities only.
+            # Zero quantity will be handled by the cancellation package.
+            if float_compare(
+                new_qty, 0, precision_rounding=rounding
+            ) <= 0:
+                raise UserError(_(
+                    "Quantity must be greater than zero. "
+                    "Use cancellation for removing an order."
+                ))
+
+            # Reject unsupported stock configurations rather than
+            # guessing which move should be updated.
+            central_moves = central.move_ids.filtered(
+                lambda m: m.state != "cancel"
+            )
+            purchase_moves = purchase.move_ids.filtered(
+                lambda m: m.state != "cancel"
+            )
+            distributor_moves = distributor.move_ids.filtered(
+                lambda m: m.state != "cancel"
+            )
+
+            move_groups = (
+                central_moves,
+                purchase_moves,
+                distributor_moves,
+            )
+
+            if any(len(group) != 1 for group in move_groups):
+                raise UserError(_(
+                    "Each linked order line must have exactly one "
+                    "active stock move for this revision version."
+                ))
+
+            moves = central_moves | purchase_moves | distributor_moves
+
+            for move in moves:
+                if move.state not in (
+                    "confirmed", "waiting", "assigned",
+                    "partially_available",
+                ):
+                    raise UserError(_(
+                        "Unsupported stock move state: %s"
+                    ) % move.state)
+
+                if move.picked or any(move.move_line_ids.mapped("picked")):
+                    raise UserError(_(
+                        "Picked stock operations cannot be revised."
+                    ))
+
+                if move.move_line_ids.filtered(
+                    lambda line: line.picked
+                ):
+                    raise UserError(_(
+                        "Stock move %(move)s contains picked operations. "
+                        "Revision is not allowed.",
+                        move=move.id,
+                    ))
+
+                move_qty = move.product_uom._compute_quantity(
+                    move.product_uom_qty, central.product_uom
+                )
+
+                if float_compare(
+                    move_qty, old_qty, precision_rounding=rounding
+                ) != 0:
+                    raise UserError(_(
+                        "Stock move quantity does not match "
+                        "the original order quantity."
+                    ))
+
+            all_moves |= moves
+            updates.append((match, moves))
+
+        # Ensure there are no unexpected active moves on linked transfers.
+        expected_moves = summary["pickings"].move_ids.filtered(
+            lambda m: m.state != "cancel"
+        )
+
+        if set(expected_moves.ids) != set(all_moves.ids):
+            _logger.error(
+                "VINCI_INTERCOMPANY | STOCK_MOVE_MISMATCH "
+                "| EXPECTED=%s | MATCHED=%s",
+                sorted(expected_moves.ids),
+                sorted(all_moves.ids),
+            )
+            raise UserError(_(
+                "Unexpected stock moves were found on linked transfers. "
+                "Revision stopped."
+            ))
+
+        original_move_ids = set(all_moves.ids)
+
+        _logger.info(
+            "VINCI_INTERCOMPANY | VALIDATION_OK | SO=%s | MOVES=%s",
+            self.sale_order_id.name,
+            sorted(original_move_ids),
+        )
+
+        # All checks above must succeed before any write.
+        for match, moves in updates:
+            central = match["central_line"]
+            purchase = match["purchase_line"]
+            distributor = match["distributor_line"]
+            new_qty = match["new_quantity"]
+
+            _logger.info(
+                "VINCI_INTERCOMPANY | QUANTITY_CHANGE | PRODUCT=%s "
+                "| OLD=%s | NEW=%s",
+                central.product_id.id,
+                central.product_uom_qty,
+                new_qty,
+            )
+
+            # Updating demand may automatically unreserve stock.
+            for move in moves:
+                move_new_qty = central.product_uom._compute_quantity(
+                    new_qty, move.product_uom
+                )
+
+                _logger.info(
+                    "VINCI_INTERCOMPANY | STOCK_MOVE_UPDATE "
+                    "| MOVE=%s | OLD=%s | NEW=%s",
+                    move.id,
+                    move.product_uom_qty,
+                    move_new_qty,
+                )
+
+                move.write({"product_uom_qty": move_new_qty})
+
+            central.with_context(
+                skip_procurement=True
+            ).write({"product_uom_qty": new_qty})
+
+            distributor.with_context(
+                skip_procurement=True
+            ).write({"product_uom_qty": new_qty})
+
+            purchase.with_context(
+                vinci_skip_purchase_picking_update=True
+            ).write({"product_qty": new_qty})
+
+        # Check that the operation did not create additional moves.
+        final_moves = summary["pickings"].move_ids.filtered(
+            lambda m: m.state != "cancel"
+        )
+
+        if set(final_moves.ids) != original_move_ids:
+            raise UserError(_(
+                "Unexpected stock moves were created during revision."
+            ))
+
+
+        # Reassign only moves that lost their reservation and are
+        # eligible for standard Odoo stock assignment.
+        moves_to_assign = all_moves.filtered(
+            lambda move:
+                move.state in ("confirmed", "partially_available")
+                and not move.picked
+                and not move.move_orig_ids
+        )
+
+        if moves_to_assign:
+            _logger.info(
+                "VINCI_INTERCOMPANY | STOCK_REASSIGN_START | MOVES=%s",
+                moves_to_assign.ids,
+            )
+            moves_to_assign._action_assign()
+
+        # Verify all order lines and stock moves after the update.
+        for match, moves in updates:
+            central = match["central_line"]
+            purchase = match["purchase_line"]
+            distributor = match["distributor_line"]
+            new_qty = match["new_quantity"]
+            rounding = central.product_uom.rounding
+
+            quantities = (
+                central.product_uom_qty,
+                purchase.product_qty,
+                distributor.product_uom_qty,
+            )
+
+            if any(
+                float_compare(qty, new_qty, precision_rounding=rounding) != 0
+                for qty in quantities
+            ):
+                raise UserError(_(
+                    "Final intercompany order quantities do not match."
+                ))
+
+            for move in moves:
+                expected_qty = central.product_uom._compute_quantity(
+                    new_qty, move.product_uom
+                )
+                if float_compare(
+                    move.product_uom_qty,
+                    expected_qty,
+                    precision_rounding=move.product_uom.rounding,
+                ) != 0:
+                    raise UserError(_(
+                        "Final stock move quantity does not match."
+                    ))
+
+
+                # Reserved quantity must never exceed the new demand.
+                if float_compare(
+                    move.quantity,
+                    move.product_uom_qty,
+                    precision_rounding=move.product_uom.rounding,
+                ) > 0:
+                    _logger.error(
+                        "VINCI_INTERCOMPANY | EXCESS_RESERVATION "
+                        "| MOVE=%s | DEMAND=%s | RESERVED=%s",
+                        move.id,
+                        move.product_uom_qty,
+                        move.quantity,
+                    )
+                    raise UserError(_(
+                        "Stock move %(move)s has a quantity greater "
+                        "than its new demand. Revision stopped.",
+                        move=move.id,
+                    ))
+
+                if move.state == "assigned" and float_compare(
+                    move.quantity,
+                    move.product_uom_qty,
+                    precision_rounding=move.product_uom.rounding,
+                ) != 0:
+                    raise UserError(_(
+                        "Assigned stock move %(move)s does not have "
+                        "the expected reserved quantity.",
+                        move=move.id,
+                    ))
+
+
+                _logger.info(
+                    "VINCI_INTERCOMPANY | FINAL_STOCK_STATE "
+                    "| MOVE=%s | STATE=%s | DEMAND=%s | RESERVED=%s",
+                    move.id,
+                    move.state,
+                    move.product_uom_qty,
+                    move.quantity,
+                )
+
+
+        _logger.info(
+            "VINCI_INTERCOMPANY | QUANTITY_UPDATE_COMPLETED | SO=%s",
+            self.sale_order_id.name,
+        )
