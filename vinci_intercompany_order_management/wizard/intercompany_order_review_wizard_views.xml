@@ -18,6 +18,8 @@
                                 <field name="original_quantity" readonly="1"/>
                                 <field name="new_quantity"/>
                                 <field name="product_uom_id" readonly="sale_order_line_id != False"/>
+                                <field name="product_packaging_id"
+                                        readonly="sale_order_line_id != False"/>
                             </list>
                         </field>
                     </page>
