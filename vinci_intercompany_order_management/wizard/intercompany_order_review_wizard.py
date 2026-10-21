@@ -140,9 +140,16 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
                     "New quantity cannot be negative."
                 ))
 
+        # Package 2: Validate whole-box quantities before matching order lines.
+        self.revision_line_ids._vinci_validate_box_quantity()
+
+        new_lines = self.revision_line_ids.filtered(
+            lambda line: not line.sale_order_line_id
+        )
+
         matches = self._vinci_match_revision_lines(summary)
 
-        if not matches:
+        if not matches and not new_lines:
             raise UserError(_(
                 "No valid revision lines were found."
             ))
@@ -150,6 +157,7 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
         return {
             "summary": summary,
             "matches": matches,
+            "new_lines": new_lines,
         }
 
 
@@ -165,6 +173,23 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
                 "Exactly one distributor PO and one distributor SO are required."
             ))
 
+        central_company = central_so.company_id
+        distributor_company = distributor_po.company_id
+
+        if distributor_so.company_id != distributor_company:
+            raise UserError(_(
+                "Distributor PO and SO belong to different companies."
+            ))
+
+        if (
+            central_company not in self.env.user.company_ids
+            or distributor_company not in self.env.user.company_ids
+        ):
+            raise UserError(_(
+                "You must have access to both the central "
+                "and distributor companies."
+            ))
+
         central_lines = central_so.order_line.filtered(
             lambda line: not line.display_type and line.product_id
         )
@@ -175,11 +200,20 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
             lambda line: not line.display_type and line.product_id
         )
 
+
+        existing_revision_lines = self.revision_line_ids.filtered(
+            lambda line: bool(line.sale_order_line_id)
+        )
+        new_revision_lines = self.revision_line_ids.filtered(
+            lambda line: not line.sale_order_line_id
+        )
+
+
         if not (
             len(central_lines)
             == len(purchase_lines)
             == len(distributor_lines)
-            == len(self.revision_line_ids)
+            == len(existing_revision_lines)
         ):
             raise UserError(_(
                 "The three orders must contain the same number of product lines."
@@ -187,14 +221,14 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
 
         matches = []
 
-        if len(set(self.revision_line_ids.mapped("sale_order_line_id").ids)) != len(
-                    self.revision_line_ids
-                ):
+        if len(set(existing_revision_lines.mapped("sale_order_line_id").ids)) != len(
+            existing_revision_lines
+        ):
             raise UserError(_(
                 "The same sales order line cannot be revised more than once."
             ))
 
-        for revision_line in self.revision_line_ids:
+        for revision_line in existing_revision_lines:
             central_line = revision_line.sale_order_line_id
 
             if central_line not in central_lines:
@@ -246,7 +280,16 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
         purchase_orders = summary["purchase_orders"]
 
         pickings = summary["pickings"]
-        moves = pickings.move_ids
+        picking_moves = pickings.move_ids
+
+        # Include directly connected stock moves in database locking.
+        # This protects against concurrent updates to linked moves.
+        connected_moves = (
+            picking_moves.move_orig_ids
+            | picking_moves.move_dest_ids
+        )
+
+        moves = picking_moves | connected_moves
 
         records_to_lock = [
             ("sale_order", sorted(sale_orders.ids)),
@@ -310,6 +353,7 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
         result = self._vinci_validate_revision()
         summary = result["summary"]
         matches = result["matches"]
+        new_lines = result["new_lines"]
 
         current_document_ids = {
             "purchase_orders": set(summary["purchase_orders"].ids),
@@ -328,8 +372,17 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
                 "during the revision. Please reopen the wizard."
             ))
 
+        # Package 2: Precheck new products after document locking.
+        # No order lines or stock moves are created here.
+        if new_lines:
+            self._vinci_add_revision_products(
+                result,
+                validate_only=True,
+            )
+
         all_moves = self.env["stock.move"]
         updates = []
+        canceled_move_ids = set()
 
         for match in matches:
             central = match["central_line"]
@@ -368,14 +421,13 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
                         "Linked order quantities do not match."
                     ))
 
-            # First implementation: positive quantities only.
-            # Zero quantity will be handled by the cancellation package.
+            # Negative quantities are forbidden.
+            # Zero means removing the product from all linked orders.
             if float_compare(
                 new_qty, 0, precision_rounding=rounding
-            ) <= 0:
+            ) < 0:
                 raise UserError(_(
-                    "Quantity must be greater than zero. "
-                    "Use cancellation for removing an order."
+                    "Quantity cannot be negative."
                 ))
 
             # Reject unsupported stock configurations rather than
@@ -403,6 +455,25 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
                 ))
 
             moves = central_moves | purchase_moves | distributor_moves
+
+            # Package 2: Prevent cancellation from affecting
+            # stock moves outside the three linked order lines.
+            if float_compare(
+                new_qty, 0, precision_rounding=rounding
+            ) == 0:
+                linked_moves = (
+                    moves.move_orig_ids | moves.move_dest_ids
+                ).filtered(lambda move: move.state != "cancel")
+
+                external_moves = linked_moves - moves
+
+                if external_moves:
+                    raise UserError(_(
+                        "Product %(product)s cannot be removed because "
+                        "its stock moves are linked to external moves: %(moves)s.",
+                        product=central.product_id.display_name,
+                        moves=", ".join(map(str, external_moves.ids)),
+                    ))
 
             for move in moves:
                 if move.state not in (
@@ -461,6 +532,12 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
 
         original_move_ids = set(all_moves.ids)
 
+        # Snapshot the cancellation scope before modifying any moves.
+        original_move_states = {
+            move.id: move.state
+            for move in all_moves
+        }
+
         _logger.info(
             "VINCI_INTERCOMPANY | VALIDATION_OK | SO=%s | MOVES=%s",
             self.sale_order_id.name,
@@ -481,6 +558,52 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
                 central.product_uom_qty,
                 new_qty,
             )
+
+            # Package 2: Remove an existing product.
+            if float_compare(
+                new_qty,
+                0,
+                precision_rounding=central.product_uom.rounding,
+            ) == 0:
+
+                _logger.info(
+                    "VINCI_INTERCOMPANY | PRODUCT_REMOVAL_START "
+                    "| PRODUCT=%s | MOVES=%s",
+                    central.product_id.id,
+                    moves.ids,
+                )
+
+                # Cancel only the validated moves.
+                # External active dependencies were rejected above.
+                moves._action_cancel()
+
+                if any(move.state != "cancel" for move in moves):
+                    raise UserError(_(
+                        "Not all stock moves were cancelled for product %s."
+                    ) % central.product_id.display_name)
+
+                # Keep the order lines for traceability.
+                central.with_context(
+                    skip_procurement=True
+                ).write({"product_uom_qty": 0})
+
+                distributor.with_context(
+                    skip_procurement=True
+                ).write({"product_uom_qty": 0})
+
+                purchase.with_context(
+                    vinci_skip_purchase_picking_update=True
+                ).write({"product_qty": 0})
+
+                canceled_move_ids.update(moves.ids)
+
+                _logger.info(
+                    "VINCI_INTERCOMPANY | PRODUCT_REMOVAL_COMPLETED "
+                    "| PRODUCT=%s",
+                    central.product_id.id,
+                )
+
+                continue
 
             # Updating demand may automatically unreserve stock.
             for move in moves:
@@ -515,9 +638,38 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
             lambda m: m.state != "cancel"
         )
 
-        if set(final_moves.ids) != original_move_ids:
+        expected_remaining_move_ids = (
+            original_move_ids - canceled_move_ids
+        )
+
+        # Every explicitly removed move must now be cancelled.
+        for move in all_moves.filtered(
+            lambda m: m.id in canceled_move_ids
+        ):
+            if move.state != "cancel":
+                raise UserError(_(
+                    "Stock move %s was not cancelled correctly."
+                ) % move.id)
+
+        # Moves belonging to products that were not removed
+        # must not be cancelled as a side effect.
+        unexpectedly_cancelled = all_moves.filtered(
+            lambda m:
+                m.id not in canceled_move_ids
+                and original_move_states.get(m.id) != "cancel"
+                and m.state == "cancel"
+        )
+
+        if unexpectedly_cancelled:
             raise UserError(_(
-                "Unexpected stock moves were created during revision."
+                "Stock cancellation affected unrelated order lines. "
+                "Affected stock moves: %s"
+            ) % ", ".join(map(str, unexpectedly_cancelled.ids)))
+
+        if set(final_moves.ids) != expected_remaining_move_ids:
+            raise UserError(_(
+                "Unexpected active stock moves were found after revision. "
+                "A stock move may have been created or cancelled unexpectedly."
             ))
 
 
@@ -544,6 +696,33 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
             distributor = match["distributor_line"]
             new_qty = match["new_quantity"]
             rounding = central.product_uom.rounding
+
+            # Verify removed products separately.
+            if float_compare(
+                new_qty, 0, precision_rounding=rounding
+            ) == 0:
+
+                if any(move.state != "cancel" for move in moves):
+                    raise UserError(_(
+                        "Removed product still has active stock moves."
+                    ))
+
+                if any(
+                    float_compare(
+                        qty, 0, precision_rounding=rounding
+                    ) != 0
+                    for qty in (
+                        central.product_uom_qty,
+                        purchase.product_qty,
+                        distributor.product_uom_qty,
+                    )
+                ):
+                    raise UserError(_(
+                        "Removed product still has a non-zero "
+                        "quantity in a linked order."
+                    ))
+
+                continue
 
             quantities = (
                 central.product_uom_qty,
@@ -618,3 +797,433 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
             "VINCI_INTERCOMPANY | QUANTITY_UPDATE_COMPLETED | SO=%s",
             self.sale_order_id.name,
         )
+
+        # Package 2: Add new products only after all existing
+        # quantity and stock validations have succeeded.
+        if new_lines:
+            self._vinci_add_revision_products(result)
+
+    def _vinci_add_revision_products(self, result, validate_only=False):
+        """Validate new products before adding intercompany order lines."""
+        self.ensure_one()
+
+        summary = result["summary"]
+        new_lines = result.get("new_lines", self.env[
+            "vinci.intercompany.revision.line"
+        ])
+
+        if not new_lines:
+            return
+
+        # Package 2: Only confirmed intercompany orders are supported.
+        central_so = self.sale_order_id
+        distributor_po = summary["purchase_orders"]
+        distributor_so = summary["counterpart_orders"]
+
+        if (
+            central_so.state != "sale"
+            or distributor_po.state != "purchase"
+            or distributor_so.state != "sale"
+        ):
+            raise UserError(_(
+                "All three intercompany orders must be confirmed "
+                "before adding new products."
+            ))
+
+        if len(distributor_po) != 1 or len(distributor_so) != 1:
+            raise UserError(_(
+                "Exactly one linked distributor PO and SO are required."
+            ))
+
+        central_company = central_so.company_id
+        distributor_company = distributor_po.company_id
+
+        if distributor_so.company_id != distributor_company:
+            raise UserError(_(
+                "Distributor PO and SO belong to different companies."
+            ))
+
+        existing_products = (
+            central_so.order_line.mapped("product_id")
+            | distributor_po.order_line.mapped("product_id")
+            | distributor_so.order_line.mapped("product_id")
+        )
+
+        seen_products = set()
+
+        for line in new_lines:
+            product = line.product_id
+
+            if not product.active:
+                raise UserError(_(
+                    "Product %s is archived and cannot be added."
+                ) % product.display_name)
+
+            if product.company_id:
+                raise UserError(_(
+                    "Product %s is company-specific. "
+                    "Only shared products can be added until "
+                    "cross-company product mapping is supported."
+                ) % product.display_name)
+
+            if product.type != "consu":
+                raise UserError(_(
+                    "Product %s must be a stockable or consumable "
+                    "product for this intercompany revision."
+                ) % product.display_name)
+
+            if product in existing_products:
+                raise UserError(_(
+                    "Product %s already exists in a linked order. "
+                    "Please revise its existing line instead."
+                ) % product.display_name)
+
+            if product.id in seen_products:
+                raise UserError(_(
+                    "Product %s was added more than once."
+                ) % product.display_name)
+
+            seen_products.add(product.id)
+
+        _logger.info(
+            "VINCI_INTERCOMPANY | NEW_PRODUCTS_VALIDATED "
+            "| SO=%s | PRODUCTS=%s",
+            central_so.name,
+            sorted(seen_products),
+        )
+
+        drop_route = self.env.ref(
+                    "stock_dropshipping.route_drop_shipping",
+                    raise_if_not_found=False,
+                )
+
+        if not drop_route:
+            raise UserError(_(
+                "Dropshipping route is not configured."
+            ))
+
+        distributor_routes = distributor_so.order_line.filtered(
+            lambda line:
+                not line.display_type
+                and line.product_id.type == "consu"
+                and bool(line.route_id)
+        ).mapped("route_id")
+
+        if len(distributor_routes) != 1:
+            raise UserError(_(
+                "Cannot determine a unique Cold Sale route from "
+                "the existing distributor sales order."
+            ))
+
+        distributor_cold_route = distributor_routes
+
+        prepared_lines = []
+
+        for line in new_lines:
+            product = line.product_id
+            packaging = line.product_packaging_id
+            quantity = line.new_quantity
+
+            box_count = quantity / packaging.qty
+
+            distributor_so_vals = {
+                "order_id": distributor_so.id,
+                "product_id": product.id,
+                "product_uom_qty": quantity,
+                "product_uom": line.product_uom_id.id,
+                "product_packaging_id": packaging.id,
+                "product_packaging_qty": box_count,
+                "route_id": distributor_cold_route.id,
+            }
+
+            distributor_po_vals = {
+                "order_id": distributor_po.id,
+                "product_id": product.id,
+                "product_qty": quantity,
+                "product_uom": line.product_uom_id.id,
+                "product_packaging_id": packaging.id,
+                "product_packaging_qty": box_count,
+                "name": product.display_name,
+                "date_planned": fields.Datetime.now(),
+            }
+
+            central_so_vals = {
+                "order_id": central_so.id,
+                "product_id": product.id,
+                "product_uom_qty": quantity,
+                "product_uom": line.product_uom_id.id,
+                "product_packaging_id": packaging.id,
+                "product_packaging_qty": box_count,
+                "route_id": drop_route.id,
+            }
+
+            prepared_lines.append({
+                "product": product,
+                "quantity": quantity,
+                "packaging": packaging,
+                "distributor_so_vals": distributor_so_vals,
+                "distributor_po_vals": distributor_po_vals,
+                "central_so_vals": central_so_vals,
+            })
+
+        _logger.info(
+            "VINCI_INTERCOMPANY | NEW_PRODUCT_LINES_PREPARED "
+            "| SO=%s | COUNT=%s",
+            central_so.name,
+            len(prepared_lines),
+        )
+
+        # Validate new products without creating order lines.
+        if validate_only:
+            _logger.info(
+                "VINCI_INTERCOMPANY | NEW_PRODUCTS_PRECHECK_OK "
+                "| SO=%s | COUNT=%s",
+                central_so.name,
+                len(prepared_lines),
+            )
+            return
+
+        # Prepare company-specific environments.
+        CentralSaleLine = self.env["sale.order.line"].with_company(
+            central_company
+        )
+
+        DistributorSaleLine = self.env["sale.order.line"].with_company(
+            distributor_company
+        )
+
+        DistributorPurchaseLine = self.env["purchase.order.line"].with_company(
+            distributor_company
+        )
+
+        _logger.info(
+            "VINCI_INTERCOMPANY | COMPANY_CONTEXT_READY "
+            "| CENTRAL=%s | DISTRIBUTOR=%s",
+            central_company.name,
+            distributor_company.name,
+        )
+
+        created_lines = []
+
+        for prepared in prepared_lines:
+            # Create the distributor's customer sales line.
+            distributor_sale_line = DistributorSaleLine.create(
+                prepared["distributor_so_vals"]
+            )
+
+            _logger.info(
+                "VINCI_INTERCOMPANY | DISTRIBUTOR_PRICE_CHECK "
+                "| PRODUCT=%s | PRICE=%s | DISCOUNT=%s "
+                "| PRICELIST=%s",
+                distributor_sale_line.product_id.id,
+                distributor_sale_line.price_unit,
+                distributor_sale_line.discount,
+                distributor_so.pricelist_id.id,
+            )
+
+            if not distributor_sale_line.currency_id:
+                raise UserError(_(
+                    "No currency is configured for the distributor "
+                    "sales order."
+                ))
+
+            if not distributor_so.pricelist_id:
+                raise UserError(_(
+                    "No pricelist is configured for the distributor "
+                    "sales order."
+                ))
+
+            if not 0 <= distributor_sale_line.discount <= 100:
+                raise UserError(_(
+                    "Invalid discount percentage for product %s."
+                ) % distributor_sale_line.product_id.display_name)
+
+            # Create the distributor's purchase line.
+            distributor_purchase_line = DistributorPurchaseLine.create(
+                prepared["distributor_po_vals"]
+            )
+
+            _logger.info(
+                "VINCI_INTERCOMPANY | PRICE_COMPARISON "
+                "| PRODUCT=%s | CUSTOMER_PRICE=%s "
+                "| CUSTOMER_DISCOUNT=%s | PURCHASE_PRICE=%s "
+                "| PURCHASE_DISCOUNT=%s",
+                prepared["product"].id,
+                distributor_sale_line.price_unit,
+                distributor_sale_line.discount,
+                distributor_purchase_line.price_unit,
+                distributor_purchase_line.discount,
+            )
+
+            # Prepare Central SO pricing from the linked Distribution PO.
+            central_vals = distributor_po._prepare_sale_order_line_data(
+                distributor_purchase_line,
+                central_company,
+            )
+
+            # Preserve the validated product, quantity, packaging and route.
+            central_vals.update(prepared["central_so_vals"])
+
+            # Create Central SO line with intercompany pricing.
+            central_sale_line = CentralSaleLine.create(central_vals)
+
+            _logger.info(
+                "VINCI_INTERCOMPANY | INTERCOMPANY_PRICE_CHECK "
+                "| PRODUCT=%s | PO_PRICE=%s | PO_DISCOUNT=%s "
+                "| CENTRAL_PRICE=%s | CENTRAL_DISCOUNT=%s",
+                prepared["product"].id,
+                distributor_purchase_line.price_unit,
+                distributor_purchase_line.discount,
+                central_sale_line.price_unit,
+                central_sale_line.discount,
+            )
+
+            if distributor_purchase_line.currency_id != central_sale_line.currency_id:
+                raise UserError(_(
+                    "Distribution PO and Central SO use different "
+                    "currencies. Currency conversion is not yet supported "
+                    "for adding new products."
+                ))
+
+            # Convert PO unit price to Central SO unit of measure.
+            po_price_in_central_uom = (
+                distributor_purchase_line.product_uom._compute_price(
+                    distributor_purchase_line.price_unit,
+                    central_sale_line.product_uom,
+                )
+            )
+
+            po_net_price = (
+                po_price_in_central_uom
+                * (1 - distributor_purchase_line.discount / 100)
+            )
+
+            central_net_price = (
+                central_sale_line.price_unit
+                * (1 - central_sale_line.discount / 100)
+            )
+
+            currency = central_sale_line.currency_id
+
+            if currency.compare_amounts(
+                po_net_price,
+                central_net_price,
+            ) != 0:
+                raise UserError(_(
+                    "Intercompany net unit price mismatch for product %s. "
+                    "Distribution PO: %s, Central SO: %s."
+                ) % (
+                    prepared["product"].display_name,
+                    po_net_price,
+                    central_net_price,
+                ))
+
+            created_lines.append({
+                "product": prepared["product"],
+                "central": central_sale_line,
+                "purchase": distributor_purchase_line,
+                "distributor": distributor_sale_line,
+            })
+
+            _logger.info(
+                "VINCI_INTERCOMPANY | NEW_PRODUCT_CREATED "
+                "| PRODUCT=%s | CENTRAL_LINE=%s "
+                "| PURCHASE_LINE=%s | DISTRIBUTOR_LINE=%s",
+                prepared["product"].id,
+                central_sale_line.id,
+                distributor_purchase_line.id,
+                distributor_sale_line.id,
+            )
+
+        for created in created_lines:
+            product = created["product"]
+
+            central_line = created["central"]
+            purchase_line = created["purchase"]
+            distributor_line = created["distributor"]
+
+            move_groups = {
+                "Central SO": central_line.move_ids.filtered(
+                    lambda m: m.state != "cancel"
+                ),
+                "Distribution PO": purchase_line.move_ids.filtered(
+                    lambda m: m.state != "cancel"
+                ),
+                "Distribution SO": distributor_line.move_ids.filtered(
+                    lambda m: m.state != "cancel"
+                ),
+            }
+
+            for document_name, moves in move_groups.items():
+                if len(moves) != 1:
+                    raise UserError(_(
+                        "New product %(product)s must have exactly "
+                        "one active stock move in %(document)s. "
+                        "Found: %(count)s.",
+                        product=product.display_name,
+                        document=document_name,
+                        count=len(moves),
+                    ))
+
+                if not moves.picking_id:
+                    raise UserError(_(
+                        "New product %(product)s has no linked "
+                        "stock picking in %(document)s.",
+                        product=product.display_name,
+                        document=document_name,
+                    ))
+
+                expected_pickings = (
+                    central_so.picking_ids
+                    if document_name == "Central SO"
+                    else distributor_po.picking_ids
+                    if document_name == "Distribution PO"
+                    else distributor_so.picking_ids
+                )
+
+                if moves.picking_id not in expected_pickings:
+                    raise UserError(_(
+                        "New product %(product)s has an unexpected "
+                        "picking in %(document)s.",
+                        product=product.display_name,
+                        document=document_name,
+                    ))
+
+                expected_company = (
+                    central_so.company_id
+                    if document_name == "Central SO"
+                    else distributor_po.company_id
+                )
+
+                if moves.company_id != expected_company:
+                    raise UserError(_(
+                        "Stock move company mismatch for %(product)s "
+                        "in %(document)s.",
+                        product=product.display_name,
+                        document=document_name,
+                    ))
+
+                if moves.picking_id.company_id != expected_company:
+                    raise UserError(_(
+                        "Stock picking company mismatch for %(product)s "
+                        "in %(document)s.",
+                        product=product.display_name,
+                        document=document_name,
+                    ))
+
+                expected_qty = created["central"].product_uom._compute_quantity(
+                    created["central"].product_uom_qty,
+                    moves.product_uom,
+                )
+
+                if float_compare(
+                    moves.product_uom_qty,
+                    expected_qty,
+                    precision_rounding=moves.product_uom.rounding,
+                ) != 0:
+                    raise UserError(_(
+                        "Stock quantity mismatch for %(product)s "
+                        "in %(document)s.",
+                        product=product.display_name,
+                        document=document_name,
+                    ))
