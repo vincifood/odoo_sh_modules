@@ -169,6 +169,12 @@ class SaleOrder(models.Model):
                     "original_quantity": line.product_uom_qty,
                     "new_quantity": line.product_uom_qty,
                     "product_uom_id": line.product_uom.id,
+                    "product_packaging_id": (
+                        line.product_packaging_id.id
+                        if line.product_packaging_id
+                        and line.product_packaging_id.package_type_id.name == "Kutu"
+                        else False
+                    ),
                 }))
 
         wizard = self.env["vinci.intercompany.order.review.wizard"].create({
