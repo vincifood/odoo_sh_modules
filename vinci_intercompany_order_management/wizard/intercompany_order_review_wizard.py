@@ -74,11 +74,7 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
             return {"type": "ir.actions.act_window_close"}
 
         if self.operation == "cancellation":
-            self.sale_order_id._vinci_get_intercompany_document_summary()
-            raise UserError(_(
-                "Cancellation is not implemented yet. "
-                "No documents have been modified."
-            ))
+            return self._vinci_cancel_undelivered_intercompany()
 
         raise UserError(_("Invalid intercompany operation."))
 
