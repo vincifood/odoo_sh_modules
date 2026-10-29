@@ -36,6 +36,10 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
         "wizard_id", "picking_id", string="Related Transfers / Returns", readonly=True
     )
 
+    # Immutable snapshot of original order lines, so deleting a row in the
+    # transient wizard cannot silently skip an existing sales order line.
+    original_line_snapshot = fields.Json(readonly=True, default=dict)
+
     revision_line_ids = fields.One2many(
         "vinci.intercompany.revision.line",
         "wizard_id",
@@ -70,11 +74,29 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
             return {"type": "ir.actions.act_window_close"}
 
         if self.operation == "cancellation":
-            self.sale_order_id._vinci_get_intercompany_document_summary()
-            raise UserError(_(
-                "Cancellation is not implemented yet. "
-                "No documents have been modified."
-            ))
+            summary = self.sale_order_id._vinci_get_intercompany_document_summary()
+            accounting_state, _sources, _reversals = self._vinci_closure_accounting_status(summary)
+            stock_status = self._vinci_closure_stock_status(summary)
+            if not stock_status["completed"] and accounting_state == "none":
+                return self._vinci_cancel_undelivered_intercompany()
+            # First deal with physical goods, regardless of invoices existing.
+            if not stock_status["ready"]:
+                if stock_status["returns"]:
+                    raise UserError(_(
+                        "An existing stock return is incomplete. Validate it in Inventory "
+                        "before continuing; no duplicate return will be created."
+                    ))
+                return self._vinci_prepare_delivery_returns()
+            # Then prepare financial reversals (once). Drafts must be posted
+            # by Accounting; the same button can then finalize closure.
+            if accounting_state == "needs_reversal":
+                return self._vinci_prepare_financial_reversals()
+            if accounting_state == "draft_reversal":
+                raise UserError(_(
+                    "Draft credit notes/vendor refunds exist. Accounting must post "
+                    "them before final closure."
+                ))
+            return self._vinci_close_returned_intercompany()
 
         raise UserError(_("Invalid intercompany operation."))
 
@@ -191,13 +213,13 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
             ))
 
         central_lines = central_so.order_line.filtered(
-            lambda line: not line.display_type and line.product_id
+            lambda line: not line.display_type and line.product_id and line.product_uom_qty > 0
         )
         purchase_lines = distributor_po.order_line.filtered(
-            lambda line: not line.display_type and line.product_id
+            lambda line: not line.display_type and line.product_id and line.product_qty > 0
         )
         distributor_lines = distributor_so.order_line.filtered(
-            lambda line: not line.display_type and line.product_id
+            lambda line: not line.display_type and line.product_id and line.product_uom_qty > 0
         )
 
 
@@ -210,13 +232,16 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
 
 
         if not (
-            len(central_lines)
-            == len(purchase_lines)
-            == len(distributor_lines)
-            == len(existing_revision_lines)
+            len(central_lines) == len(purchase_lines) == len(distributor_lines)
         ):
             raise UserError(_(
                 "The three orders must contain the same number of product lines."
+            ))
+
+        snapshot = self.original_line_snapshot or {}
+        if set(map(str, central_lines.ids)) != set(snapshot):
+            raise UserError(_(
+                "Original sales order lines have changed. Please reopen the wizard."
             ))
 
         matches = []
@@ -268,6 +293,29 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
                 "purchase_line": po_line,
                 "distributor_line": distributor_line,
                 "new_quantity": revision_line.new_quantity,
+            })
+
+        # A missing original wizard row means the user deleted that row.
+        # Convert it to an explicit zero-quantity revision for all 3 orders.
+        visible_ids = set(existing_revision_lines.mapped("sale_order_line_id").ids)
+        for central_line in central_lines.filtered(lambda rec: rec.id not in visible_ids):
+            po_matches = purchase_lines.filtered(
+                lambda rec: rec.product_id == central_line.product_id
+            )
+            so_matches = distributor_lines.filtered(
+                lambda rec: rec.product_id == central_line.product_id
+            )
+            if len(po_matches) != 1 or len(so_matches) != 1:
+                raise UserError(_(
+                    "A removed product cannot be matched uniquely across linked orders."
+                ))
+            matches.append({
+                "central_line": central_line,
+                "purchase_line": po_matches[0],
+                "distributor_line": so_matches[0],
+                "new_quantity": 0.0,
+                "original_quantity": snapshot[str(central_line.id)],
+                "deleted_in_wizard": True,
             })
 
         return matches
@@ -397,12 +445,13 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
             rounding = central.product_uom.rounding
             old_qty = central.product_uom_qty
 
-            if len(revision_line) != 1:
+            if not match.get("deleted_in_wizard") and len(revision_line) != 1:
                 raise UserError(_("Revision line mismatch."))
 
-            if float_compare(
+            original_qty = (self.original_line_snapshot or {}).get(str(central.id))
+            if original_qty is None or float_compare(
                 old_qty,
-                revision_line.original_quantity,
+                original_qty,
                 precision_rounding=rounding,
             ) != 0:
                 raise UserError(_(
@@ -892,15 +941,17 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
             sorted(seen_products),
         )
 
-        drop_route = self.env.ref(
-                    "stock_dropshipping.route_drop_shipping",
-                    raise_if_not_found=False,
-                )
-
-        if not drop_route:
+        # Reuse the central order's actual stock route, not Dropshipping.
+        # A False route is valid: the warehouse's normal delivery rule applies.
+        central_routes = central_so.order_line.filtered(
+            lambda line: not line.display_type and line.product_id
+            and line.product_uom_qty > 0
+        ).mapped("route_id")
+        if len(central_routes) > 1:
             raise UserError(_(
-                "Dropshipping route is not configured."
+                "Central SO lines have different routes. Cannot choose one safely."
             ))
+        central_route = central_routes[:1]
 
         distributor_routes = distributor_so.order_line.filtered(
             lambda line:
@@ -954,7 +1005,7 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
                 "product_uom": line.product_uom_id.id,
                 "product_packaging_id": packaging.id,
                 "product_packaging_qty": box_count,
-                "route_id": drop_route.id,
+                "route_id": central_route.id if central_route else False,
             }
 
             prepared_lines.append({
@@ -1078,44 +1129,12 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
                 central_sale_line.discount,
             )
 
-            if distributor_purchase_line.currency_id != central_sale_line.currency_id:
+            # Prices and discounts are company/document-specific. They can
+            # legally differ, including promotional discounts on Central SO.
+            # Do not enforce PO net price == Central SO net price.
+            if not central_sale_line.currency_id or not distributor_purchase_line.currency_id:
                 raise UserError(_(
-                    "Distribution PO and Central SO use different "
-                    "currencies. Currency conversion is not yet supported "
-                    "for adding new products."
-                ))
-
-            # Convert PO unit price to Central SO unit of measure.
-            po_price_in_central_uom = (
-                distributor_purchase_line.product_uom._compute_price(
-                    distributor_purchase_line.price_unit,
-                    central_sale_line.product_uom,
-                )
-            )
-
-            po_net_price = (
-                po_price_in_central_uom
-                * (1 - distributor_purchase_line.discount / 100)
-            )
-
-            central_net_price = (
-                central_sale_line.price_unit
-                * (1 - central_sale_line.discount / 100)
-            )
-
-            currency = central_sale_line.currency_id
-
-            if currency.compare_amounts(
-                po_net_price,
-                central_net_price,
-            ) != 0:
-                raise UserError(_(
-                    "Intercompany net unit price mismatch for product %s. "
-                    "Distribution PO: %s, Central SO: %s."
-                ) % (
-                    prepared["product"].display_name,
-                    po_net_price,
-                    central_net_price,
+                    "A linked order line has no currency configured."
                 ))
 
             created_lines.append({
@@ -1134,6 +1153,15 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
                 distributor_purchase_line.id,
                 distributor_sale_line.id,
             )
+
+        # New lines on already-confirmed orders may not launch procurement
+        # automatically. Ask Odoo's standard engines to create the stock moves.
+        # They must stay within the three original picking groups; otherwise
+        # the strict checks below fail and the entire RPC transaction rolls back.
+        for created in created_lines:
+            created["central"].with_company(central_company)._action_launch_stock_rule()
+            created["distributor"].with_company(distributor_company)._action_launch_stock_rule()
+        distributor_po.with_company(distributor_company)._create_picking()
 
         for created in created_lines:
             product = created["product"]

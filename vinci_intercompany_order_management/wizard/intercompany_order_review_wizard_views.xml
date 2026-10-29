@@ -12,11 +12,13 @@
                 <notebook>
                     <page string="Revision Lines" invisible="operation != 'revision'">
                         <field name="revision_line_ids" nolabel="1">
-                            <list editable="bottom" create="1" delete="0">
+                            <list editable="bottom" create="1" delete="1">
                                 <field name="sale_order_line_id" column_invisible="1"/>
                                 <field name="product_id" readonly="sale_order_line_id != False"/>
-                                <field name="original_quantity" readonly="1"/>
-                                <field name="new_quantity"/>
+                                <field name="original_quantity" column_invisible="1"/>
+                                <field name="new_quantity" column_invisible="1"/>
+                                <field name="original_box_quantity" readonly="1"/>
+                                <field name="new_box_quantity" string="New Boxes"/>
                                 <field name="product_uom_id" readonly="sale_order_line_id != False"/>
                                 <field name="product_packaging_id"
                                         readonly="sale_order_line_id != False"/>
