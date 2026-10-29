@@ -1,13 +1,13 @@
 {
     "name": "Vinci Intercompany Order Management",
-    "version": "18.0.1.3.0",
+    "version": "18.0.1.4.0",
     "summary": "Safely review and manage linked intercompany order documents",
     "description": """
 Package 2 product revision, Package 3A safe pre-delivery cancellation,
 Package 3B preparation of unvalidated physical stock returns, and Package 3C
 preparation of draft invoice reversals after validated stock returns.
-Financial drafts are NOT posted. Final cancellation after completed physical
-and financial returns is not automated in this release.
+Package 3D finalizes linked order cancellation only after physical returns
+and applicable credit notes / vendor refunds have been posted.
     """,
     "category": "Sales",
     "author": "Vinci Food - Onur Deniz",

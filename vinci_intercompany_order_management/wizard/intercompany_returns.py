@@ -33,11 +33,6 @@ class VinciIntercompanyReturns(models.TransientModel):
         if (central.state != "sale" or distributor.state != "sale"
                 or po.state != "purchase"):
             raise UserError(_("All three orders must remain confirmed. Reopen the wizard."))
-        if summary["sale_invoices"] or summary["purchase_invoices"]:
-            raise UserError(_(
-                "Invoices, credit notes or bills exist. Package 3B cannot process "
-                "these orders until the accounting workflow is implemented."
-            ))
         if not pickings:
             raise UserError(_("No stock transfers were linked to the three orders."))
 

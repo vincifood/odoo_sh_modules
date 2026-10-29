@@ -75,12 +75,28 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
 
         if self.operation == "cancellation":
             summary = self.sale_order_id._vinci_get_intercompany_document_summary()
-            # Accounting takes priority only after physical return completion.
-            if summary["sale_invoices"] or summary["purchase_invoices"]:
-                return self._vinci_prepare_financial_reversals()
-            if any(p.state == "done" for p in summary["pickings"]):
+            accounting_state, _sources, _reversals = self._vinci_closure_accounting_status(summary)
+            stock_status = self._vinci_closure_stock_status(summary)
+            if not stock_status["completed"] and accounting_state == "none":
+                return self._vinci_cancel_undelivered_intercompany()
+            # First deal with physical goods, regardless of invoices existing.
+            if not stock_status["ready"]:
+                if stock_status["returns"]:
+                    raise UserError(_(
+                        "An existing stock return is incomplete. Validate it in Inventory "
+                        "before continuing; no duplicate return will be created."
+                    ))
                 return self._vinci_prepare_delivery_returns()
-            return self._vinci_cancel_undelivered_intercompany()
+            # Then prepare financial reversals (once). Drafts must be posted
+            # by Accounting; the same button can then finalize closure.
+            if accounting_state == "needs_reversal":
+                return self._vinci_prepare_financial_reversals()
+            if accounting_state == "draft_reversal":
+                raise UserError(_(
+                    "Draft credit notes/vendor refunds exist. Accounting must post "
+                    "them before final closure."
+                ))
+            return self._vinci_close_returned_intercompany()
 
         raise UserError(_("Invalid intercompany operation."))
 
