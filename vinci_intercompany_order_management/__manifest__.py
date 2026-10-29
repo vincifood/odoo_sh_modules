@@ -1,12 +1,13 @@
 {
     "name": "Vinci Intercompany Order Management",
-    "version": "18.0.1.0.0",
+    "version": "18.0.1.4.0",
     "summary": "Safely review and manage linked intercompany order documents",
     "description": """
-Initial foundation for reviewing intercompany sales/purchase orders and their
-related invoices and stock transfers. The first version intentionally performs
-a read-only preview; revision/cancellation operations will be added after the
-links and business rules are verified in a test database.
+Package 2 product revision, Package 3A safe pre-delivery cancellation,
+Package 3B preparation of unvalidated physical stock returns, and Package 3C
+preparation of draft invoice reversals after validated stock returns.
+Package 3D finalizes linked order cancellation only after physical returns
+and applicable credit notes / vendor refunds have been posted.
     """,
     "category": "Sales",
     "author": "Vinci Food - Onur Deniz",
