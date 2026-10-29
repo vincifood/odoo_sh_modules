@@ -75,6 +75,9 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
 
         if self.operation == "cancellation":
             summary = self.sale_order_id._vinci_get_intercompany_document_summary()
+            # Accounting takes priority only after physical return completion.
+            if summary["sale_invoices"] or summary["purchase_invoices"]:
+                return self._vinci_prepare_financial_reversals()
             if any(p.state == "done" for p in summary["pickings"]):
                 return self._vinci_prepare_delivery_returns()
             return self._vinci_cancel_undelivered_intercompany()

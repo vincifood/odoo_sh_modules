@@ -1,13 +1,13 @@
 {
     "name": "Vinci Intercompany Order Management",
-    "version": "18.0.1.2.0",
+    "version": "18.0.1.3.0",
     "summary": "Safely review and manage linked intercompany order documents",
     "description": """
-Review and revise linked intercompany orders. Package 3A supports conservative
-cancellation only for undelivered/uninvoiced orders. Package 3B can prepare
-stock return transfers for done pickings with untracked goods, keeping these
-returns pending warehouse validation. Original orders are not yet cancelled
-when returns are prepared; invoices and financial reversals remain blocked.
+Package 2 product revision, Package 3A safe pre-delivery cancellation,
+Package 3B preparation of unvalidated physical stock returns, and Package 3C
+preparation of draft invoice reversals after validated stock returns.
+Financial drafts are NOT posted. Final cancellation after completed physical
+and financial returns is not automated in this release.
     """,
     "category": "Sales",
     "author": "Vinci Food - Onur Deniz",
