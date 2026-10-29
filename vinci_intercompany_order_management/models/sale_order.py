@@ -157,29 +157,48 @@ class SaleOrder(models.Model):
         summary = self._vinci_get_intercompany_document_summary()
 
         revision_lines = []
+        original_snapshot = {}
 
         if operation == "revision":
             for line in self.order_line:
-                if line.display_type or not line.product_id:
+                if line.display_type or not line.product_id or line.product_uom_qty <= 0:
                     continue
+
+                original_snapshot[str(line.id)] = line.product_uom_qty
+                packaging = line.product_packaging_id
+                if not packaging or packaging.package_type_id.name != "Kutu":
+                    candidate = line.product_id.default_product_packaging_id
+                    if candidate and candidate.package_type_id.name == "Kutu":
+                        packaging = candidate
+                    else:
+                        packaging = False
+
+                original_boxes = 0.0
+                if packaging and packaging.qty > 0:
+                    base_qty = line.product_uom._compute_quantity(
+                        line.product_uom_qty, line.product_id.uom_id
+                    )
+                    original_boxes = base_qty / packaging.qty
+                    # Legacy non-whole quantities must not be rounded silently.
+                    if abs(original_boxes - round(original_boxes)) > 1e-6:
+                        packaging = False
+                        original_boxes = 0.0
 
                 revision_lines.append((0, 0, {
                     "sale_order_line_id": line.id,
                     "product_id": line.product_id.id,
                     "original_quantity": line.product_uom_qty,
                     "new_quantity": line.product_uom_qty,
+                    "original_box_quantity": original_boxes,
+                    "new_box_quantity": original_boxes,
                     "product_uom_id": line.product_uom.id,
-                    "product_packaging_id": (
-                        line.product_packaging_id.id
-                        if line.product_packaging_id
-                        and line.product_packaging_id.package_type_id.name == "Kutu"
-                        else False
-                    ),
+                    "product_packaging_id": packaging.id if packaging else False,
                 }))
 
         wizard = self.env["vinci.intercompany.order.review.wizard"].create({
             "sale_order_id": self.id,
             "operation": operation,
+            "original_line_snapshot": original_snapshot,
             "revision_line_ids": revision_lines,
             "purchase_order_ids": [
                 (6, 0, summary["purchase_orders"].ids)
