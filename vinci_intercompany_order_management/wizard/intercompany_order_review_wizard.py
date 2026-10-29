@@ -74,6 +74,9 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
             return {"type": "ir.actions.act_window_close"}
 
         if self.operation == "cancellation":
+            summary = self.sale_order_id._vinci_get_intercompany_document_summary()
+            if any(p.state == "done" for p in summary["pickings"]):
+                return self._vinci_prepare_delivery_returns()
             return self._vinci_cancel_undelivered_intercompany()
 
         raise UserError(_("Invalid intercompany operation."))
