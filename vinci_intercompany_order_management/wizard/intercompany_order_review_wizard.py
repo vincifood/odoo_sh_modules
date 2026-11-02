@@ -1267,22 +1267,88 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
             outbound_qty = created["distributor"].product_uom._compute_quantity(
                 created["distributor"].product_uom_qty, template.product_uom
             )
-            outbound_move = StockMove.create({
-                "name": created["distributor"].name or created["product"].display_name,
-                "product_id": created["product"].id,
-                "product_uom_qty": outbound_qty,
-                "product_uom": template.product_uom.id,
-                "company_id": distributor_company.id,
-                "picking_id": template.picking_id.id,
-                "location_id": template.location_id.id,
-                "location_dest_id": template.location_dest_id.id,
-                "group_id": template.group_id.id or False,
-                "sale_line_id": created["distributor"].id,
-                "origin": distributor_so.name,
-                "propagate_cancel": template.propagate_cancel,
-                "move_orig_ids": [(4, po_moves.id)],
-            })
-            outbound_move._action_confirm(merge=False)
+            # An SO line created on a confirmed order may already have a
+            # delivery move (custom create hooks / procurement rules). Never
+            # create a second move for the same sale line.
+            existing_delivery_moves = created["distributor"].move_ids.filtered(
+                lambda m: m.state != "cancel"
+            )
+            if len(existing_delivery_moves) > 1:
+                raise UserError(_(
+                    "New product %(product)s already has %(count)s active "
+                    "Distribution SO moves before the manual move step. "
+                    "The revision was rolled back to avoid duplicate stock."
+                ) % {
+                    "product": created["product"].display_name,
+                    "count": len(existing_delivery_moves),
+                })
+
+            if existing_delivery_moves:
+                outbound_move = existing_delivery_moves
+                # Never silently move an automatically generated transfer into
+                # another warehouse/picking. Stop if its logistics differ.
+                if (
+                    outbound_move.picking_id != template.picking_id
+                    or outbound_move.company_id != distributor_company
+                    or outbound_move.location_id != template.location_id
+                    or outbound_move.location_dest_id != template.location_dest_id
+                    or outbound_move.product_uom != template.product_uom
+                ):
+                    raise UserError(_(
+                        "An automatic Distribution SO delivery move already "
+                        "exists for %(product)s, but its picking, location or "
+                        "UoM differs from the existing delivery. The revision "
+                        "was stopped to avoid incorrect stock transfers."
+                    ) % {"product": created["product"].display_name})
+                other_origins = outbound_move.move_orig_ids.filtered(
+                    lambda move: move.id != po_moves.id and move.state != "cancel"
+                )
+                if other_origins:
+                    raise UserError(_(
+                        "Existing Distribution SO stock move for %(product)s "
+                        "is linked to other upstream moves (%(ids)s). "
+                        "Cannot safely attach it to the original PO."
+                    ) % {
+                        "product": created["product"].display_name,
+                        "ids": ", ".join(str(i) for i in other_origins.ids),
+                    })
+                expected_qty = created["distributor"].product_uom._compute_quantity(
+                    created["distributor"].product_uom_qty,
+                    outbound_move.product_uom,
+                )
+                if float_compare(
+                    outbound_move.product_uom_qty,
+                    expected_qty,
+                    precision_rounding=outbound_move.product_uom.rounding,
+                ) != 0:
+                    raise UserError(_(
+                        "Existing Distribution SO move has an unexpected "
+                        "quantity for %s; no duplicate move was created."
+                    ) % created["product"].display_name)
+                if po_moves not in outbound_move.move_orig_ids:
+                    outbound_move.write({"move_orig_ids": [(4, po_moves.id)]})
+                _logger.info(
+                    "VINCI_INTERCOMPANY | EXISTING_DELIVERY_MOVE_REUSED "
+                    "| SO_MOVE=%s | PO_MOVE=%s",
+                    outbound_move.id, po_moves.id,
+                )
+            else:
+                outbound_move = StockMove.create({
+                    "name": created["distributor"].name or created["product"].display_name,
+                    "product_id": created["product"].id,
+                    "product_uom_qty": outbound_qty,
+                    "product_uom": template.product_uom.id,
+                    "company_id": distributor_company.id,
+                    "picking_id": template.picking_id.id,
+                    "location_id": template.location_id.id,
+                    "location_dest_id": template.location_dest_id.id,
+                    "group_id": template.group_id.id or False,
+                    "sale_line_id": created["distributor"].id,
+                    "origin": distributor_so.name,
+                    "propagate_cancel": template.propagate_cancel,
+                    "move_orig_ids": [(4, po_moves.id)],
+                })
+                outbound_move._action_confirm(merge=False)
             _logger.info(
                 "VINCI_INTERCOMPANY | REUSED_PO_STOCK_CHAIN | PO=%s "
                 "| IN_MOVE=%s | OUT_MOVE=%s",
