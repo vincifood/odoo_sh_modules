@@ -199,11 +199,13 @@ class VinciIntercompanyClosure(models.TransientModel):
             "VINCI_INTERCOMPANY | FINAL_CLOSURE_START | SO=%s | USER=%s",
             central.name, self.env.user.id,
         )
-        # Odoo standard business methods: never force states with SQL/write().
-        # If an override opens a confirmation wizard, our verification rejects
-        # the incomplete operation and the current transaction rolls back.
-        central.with_company(central.company_id).action_cancel()
-        distributor.with_company(distributor.company_id).action_cancel()
+        # Use standard business methods; never force states through SQL/write().
+        # The intercompany flow already obtained two confirmations, so
+        # suppress Odoo's additional sale.order.cancel popup (which would
+        # otherwise return an action without cancelling the sale order).
+        # All other business validations and final-state checks still apply.
+        central.with_company(central.company_id).with_context(disable_cancel_warning=True).action_cancel()
+        distributor.with_company(distributor.company_id).with_context(disable_cancel_warning=True).action_cancel()
         po.with_company(po.company_id).button_cancel()
         self.env.invalidate_all()
         if (central.state != "cancel" or distributor.state != "cancel" or po.state != "cancel"):

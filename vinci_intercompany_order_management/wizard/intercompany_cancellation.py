@@ -120,12 +120,16 @@ class VinciIntercompanyCancellation(models.TransientModel):
             self.env.user.id, original_moves.ids,
         )
 
-        # Standard Odoo business methods, rather than directly setting state.
-        # We verify outcomes because custom overrides may instead return a wizard.
-        central_so.with_company(central_so.company_id).action_cancel()
+        # The intercompany wizard already obtained two explicit confirmations.
+        # Odoo sale.order.action_cancel() may otherwise return a second
+        # sale.order.cancel popup without changing the order state.
+        # Use the standard cancellation method, skipping only that popup;
+        # locks and business validations still apply.
+        # Verify final states because custom overrides can still intervene.
+        central_so.with_company(central_so.company_id).with_context(disable_cancel_warning=True).action_cancel()
         if central_so.state != "cancel":
             raise UserError(_("Central SO was not cancelled by the standard workflow."))
-        distributor_so.with_company(distributor_so.company_id).action_cancel()
+        distributor_so.with_company(distributor_so.company_id).with_context(disable_cancel_warning=True).action_cancel()
         if distributor_so.state != "cancel":
             raise UserError(_("Distributor SO was not cancelled by the standard workflow."))
         distributor_po.with_company(distributor_po.company_id).button_cancel()
