@@ -1,6 +1,6 @@
 {
     "name": "Vinci Intercompany Order Management",
-    "version": "18.0.1.4.0",
+    "version": "18.0.1.5.0",
     "summary": "Safely review and manage linked intercompany order documents",
     "description": """
 Package 2 product revision, Package 3A safe pre-delivery cancellation,

@@ -7,9 +7,10 @@
             <form string="Intercompany Document Review">
                 <group>
                     <field name="sale_order_id"/>
-                    <field name="operation"/>
+                    <field name="operation" invisible="1"/>
+                    <field name="cancellation_confirmation_stage" invisible="1"/>
                 </group>
-                <notebook>
+                <notebook invisible="cancellation_confirmation_stage != 'none'">
                     <page string="Revision Lines" invisible="operation != 'revision'">
                         <field name="revision_line_ids" nolabel="1">
                             <list editable="bottom" create="1" delete="1">
@@ -76,8 +77,30 @@
                         </field>
                     </page>
                 </notebook>
+                <group invisible="cancellation_confirmation_stage != 'first'">
+                    <div class="alert alert-warning">WARNING: This operation affects the Central SO, Distribution PO, Distribution SO and their stock/accounting documents. First confirmation.</div>
+                </group>
+                <group invisible="cancellation_confirmation_stage != 'second'">
+                    <div class="alert alert-danger">FINAL CONFIRMATION: The cancellation workflow can prepare physical returns and accounting reversals. Are you certain you want to proceed?</div>
+                </group>
                 <footer>
-                    <button name="action_confirm" type="object" string="Continue" class="btn-primary"/>
+                    <button name="action_confirm" type="object" string="Apply Revision"
+                            class="btn-primary" invisible="cancellation_confirmation_stage != 'none'"/>
+                    <button name="action_request_full_cancellation" type="object"
+                            string="Cancel All Linked Documents" class="btn-secondary"
+                            groups="sales_team.group_sale_manager"
+                            invisible="cancellation_confirmation_stage != 'none'"/>
+                    <button name="action_confirm_full_cancellation_first" type="object"
+                            string="Yes, Continue to Final Confirmation" class="btn-secondary"
+                            groups="sales_team.group_sale_manager"
+                            invisible="cancellation_confirmation_stage != 'first'"/>
+                    <button name="action_confirm_full_cancellation_final" type="object"
+                            string="FINAL CONFIRMATION: Cancel Linked Documents" class="btn-danger"
+                            groups="sales_team.group_sale_manager"
+                            invisible="cancellation_confirmation_stage != 'second'"/>
+                    <button name="action_back_to_revision" type="object"
+                            string="Back to Revision" class="btn-secondary"
+                            invisible="cancellation_confirmation_stage == 'none'"/>
                     <button string="Close" special="cancel" class="btn-secondary"/>
                 </footer>
             </form>

@@ -36,6 +36,58 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
         "wizard_id", "picking_id", string="Related Transfers / Returns", readonly=True
     )
 
+    cancellation_confirmation_stage = fields.Selection([
+        ("none", "Not requested"),
+        ("first", "First confirmation"),
+        ("second", "Final confirmation"),
+    ], default="none", readonly=True, required=True)
+
+    def _vinci_reopen_review(self):
+        self.ensure_one()
+        return {
+            "type": "ir.actions.act_window",
+            "name": _("Intercompany Document Review"),
+            "res_model": self._name,
+            "view_mode": "form",
+            "res_id": self.id,
+            "target": "new",
+        }
+
+    def _vinci_check_cancellation_access(self):
+        self.ensure_one()
+        if self.operation != "revision" or not self.env.user.has_group(
+            "sales_team.group_sale_manager"
+        ):
+            raise UserError(_("Only Sales Managers may cancel the linked documents."))
+        # Recheck before presenting confirmation, not only after clicking confirm.
+        self.sale_order_id._vinci_get_intercompany_document_summary()
+
+    def action_request_full_cancellation(self):
+        self._vinci_check_cancellation_access()
+        self.write({"cancellation_confirmation_stage": "first"})
+        return self._vinci_reopen_review()
+
+    def action_confirm_full_cancellation_first(self):
+        self._vinci_check_cancellation_access()
+        if self.cancellation_confirmation_stage != "first":
+            raise UserError(_("The first cancellation confirmation is missing."))
+        self.write({"cancellation_confirmation_stage": "second"})
+        return self._vinci_reopen_review()
+
+    def action_back_to_revision(self):
+        self.ensure_one()
+        if self.operation != "revision":
+            raise UserError(_("Invalid revision operation."))
+        self.write({"cancellation_confirmation_stage": "none"})
+        return self._vinci_reopen_review()
+
+    def action_confirm_full_cancellation_final(self):
+        self._vinci_check_cancellation_access()
+        if self.cancellation_confirmation_stage != "second":
+            raise UserError(_("Both cancellation confirmations are required."))
+        self.write({"operation": "cancellation"})
+        return self.action_confirm()
+
     # Immutable snapshot of original order lines, so deleting a row in the
     # transient wizard cannot silently skip an existing sales order line.
     original_line_snapshot = fields.Json(readonly=True, default=dict)
@@ -50,6 +102,8 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
         self.ensure_one()
 
         if self.operation == "revision":
+            if self.cancellation_confirmation_stage != "none":
+                raise UserError(_("Finish or cancel the cancellation confirmation first."))
             _logger.info(
                 "VINCI_INTERCOMPANY | REVISION_START | SO=%s | USER=%s",
                 self.sale_order_id.name,
@@ -1158,10 +1212,91 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
         # automatically. Ask Odoo's standard engines to create the stock moves.
         # They must stay within the three original picking groups; otherwise
         # the strict checks below fail and the entire RPC transaction rolls back.
+        # Launch only Central SO procurement. Launching distributor Cold Sale
+        # procurement again would run its MTO/Buy rule and create another PO.
+        # The distribution PO is already present and already has the new line.
+        existing_origin_po_ids = set(self.env["purchase.order"].search([
+            ("company_id", "=", distributor_company.id),
+            ("origin", "=", distributor_so.name),
+        ]).ids)
         for created in created_lines:
             created["central"].with_company(central_company)._action_launch_stock_rule()
-            created["distributor"].with_company(distributor_company)._action_launch_stock_rule()
         distributor_po.with_company(distributor_company)._create_picking()
+
+        # The distributor outbound stock move must consume the incoming stock
+        # from the *existing* PO, not request a new purchase via its Buy route.
+        # Clone the logistical configuration of an existing outbound move,
+        # while explicitly setting its product, quantity and PO dependency.
+        created_lines_distributor = self.env["sale.order.line"].browse(
+            [row["distributor"].id for row in created_lines]
+        )
+        existing_outbound_moves = distributor_so.order_line.move_ids.filtered(
+            lambda m: m.state not in ("cancel", "done")
+            and m.sale_line_id not in created_lines_distributor
+        )
+        templates = existing_outbound_moves.filtered(
+            lambda m: m.picking_id and m.company_id == distributor_company
+            and m.location_id and m.location_dest_id
+        )
+        if not templates:
+            raise UserError(_(
+                "Cannot find an active Distribution SO delivery move to reuse "
+                "for new product lines. No new PO was created."
+            ))
+        template_signatures = {
+            (m.picking_id.id, m.location_id.id, m.location_dest_id.id,
+             m.product_uom.id, m.group_id.id)
+            for m in templates
+        }
+        if len(template_signatures) != 1:
+            raise UserError(_(
+                "Distribution SO uses multiple delivery move configurations. "
+                "Cannot safely add a product without creating a new PO."
+            ))
+        template = templates[:1]
+        StockMove = self.env["stock.move"].with_company(distributor_company)
+        for created in created_lines:
+            po_moves = created["purchase"].move_ids.filtered(
+                lambda m: m.state != "cancel"
+            )
+            if len(po_moves) != 1 or not po_moves.picking_id:
+                raise UserError(_(
+                    "Existing Distribution PO did not produce exactly one "
+                    "incoming stock move for %s."
+                ) % created["product"].display_name)
+            outbound_qty = created["distributor"].product_uom._compute_quantity(
+                created["distributor"].product_uom_qty, template.product_uom
+            )
+            outbound_move = StockMove.create({
+                "name": created["distributor"].name or created["product"].display_name,
+                "product_id": created["product"].id,
+                "product_uom_qty": outbound_qty,
+                "product_uom": template.product_uom.id,
+                "company_id": distributor_company.id,
+                "picking_id": template.picking_id.id,
+                "location_id": template.location_id.id,
+                "location_dest_id": template.location_dest_id.id,
+                "group_id": template.group_id.id or False,
+                "sale_line_id": created["distributor"].id,
+                "origin": distributor_so.name,
+                "propagate_cancel": template.propagate_cancel,
+                "move_orig_ids": [(4, po_moves.id)],
+            })
+            outbound_move._action_confirm(merge=False)
+            _logger.info(
+                "VINCI_INTERCOMPANY | REUSED_PO_STOCK_CHAIN | PO=%s "
+                "| IN_MOVE=%s | OUT_MOVE=%s",
+                distributor_po.name, po_moves.id, outbound_move.id,
+            )
+        after_origin_po_ids = set(self.env["purchase.order"].search([
+            ("company_id", "=", distributor_company.id),
+            ("origin", "=", distributor_so.name),
+        ]).ids)
+        if after_origin_po_ids != existing_origin_po_ids:
+            raise UserError(_(
+                "An unexpected new purchase order was generated by the revision. "
+                "The transaction has been stopped."
+            ))
 
         for created in created_lines:
             product = created["product"]
