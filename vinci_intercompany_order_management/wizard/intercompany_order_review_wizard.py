@@ -1315,6 +1315,18 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
                     "count": len(existing_delivery_moves),
                 })
 
+            # Preserve the box packaging on the *stock move* too. The SO line
+            # stores it already, but manually created moves do not inherit it.
+            packaging = created["distributor"].product_packaging_id
+            if not packaging or packaging.product_id != created["product"]:
+                raise UserError(_(
+                    "Box packaging is missing or does not match product %s."
+                ) % created["product"].display_name)
+            if packaging.qty <= 0:
+                raise UserError(_(
+                    "Invalid box packaging quantity for %s."
+                ) % created["product"].display_name)
+
             if existing_delivery_moves:
                 outbound_move = existing_delivery_moves
                 # Never silently move an automatically generated transfer into
@@ -1357,8 +1369,17 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
                         "Existing Distribution SO move has an unexpected "
                         "quantity for %s; no duplicate move was created."
                     ) % created["product"].display_name)
+                if outbound_move.product_packaging_id and outbound_move.product_packaging_id != packaging:
+                    raise UserError(_(
+                        "The existing delivery move has a different packaging for %s."
+                    ) % created["product"].display_name)
+                outbound_update = {}
+                if not outbound_move.product_packaging_id:
+                    outbound_update["product_packaging_id"] = packaging.id
                 if po_moves not in outbound_move.move_orig_ids:
-                    outbound_move.write({"move_orig_ids": [(4, po_moves.id)]})
+                    outbound_update["move_orig_ids"] = [(4, po_moves.id)]
+                if outbound_update:
+                    outbound_move.write(outbound_update)
                 _logger.info(
                     "VINCI_INTERCOMPANY | EXISTING_DELIVERY_MOVE_REUSED "
                     "| SO_MOVE=%s | PO_MOVE=%s",
@@ -1368,6 +1389,7 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
                 outbound_move = StockMove.create({
                     "name": created["distributor"].name or created["product"].display_name,
                     "product_id": created["product"].id,
+                    "product_packaging_id": packaging.id,
                     "product_uom_qty": outbound_qty,
                     "product_uom": template.product_uom.id,
                     "company_id": distributor_company.id,
@@ -1381,6 +1403,10 @@ class VinciIntercompanyOrderReviewWizard(models.TransientModel):
                     "move_orig_ids": [(4, po_moves.id)],
                 })
                 outbound_move._action_confirm(merge=False)
+            if outbound_move.product_packaging_id != packaging:
+                raise UserError(_(
+                    "Distribution delivery packaging was not retained for %s."
+                ) % created["product"].display_name)
             _logger.info(
                 "VINCI_INTERCOMPANY | REUSED_PO_STOCK_CHAIN | PO=%s "
                 "| IN_MOVE=%s | OUT_MOVE=%s",
