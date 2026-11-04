@@ -4,3 +4,4 @@ from . import intercompany_cancellation
 from . import intercompany_returns
 from . import intercompany_accounting
 from . import intercompany_closure
+from . import bulk_document_line_wizard
