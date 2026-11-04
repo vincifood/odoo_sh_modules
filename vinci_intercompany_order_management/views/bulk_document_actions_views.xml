@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_sale_order_vinci_bulk_preconfirm" model="ir.ui.view">
+        <field name="name">sale.order.form.vinci.bulk.preconfirm</field>
+        <field name="model">sale.order</field>
+        <field name="inherit_id" ref="sale.view_order_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//sheet" position="inside">
+                <field name="vinci_bulk_preconfirm_available" invisible="1"/>
+            </xpath>
+            <xpath expr="//header" position="inside">
+                <button name="action_vinci_bulk_route" type="object" string="Toplu Rota"
+                        class="btn-secondary" groups="sales_team.group_sale_salesman"
+                        invisible="not vinci_bulk_preconfirm_available"/>
+                <button name="action_vinci_bulk_tax" type="object" string="Toplu KDV"
+                        class="btn-secondary" groups="sales_team.group_sale_salesman"
+                        invisible="not vinci_bulk_preconfirm_available"/>
+            </xpath>
+        </field>
+    </record>
+
+    <record id="view_purchase_order_vinci_bulk_preconfirm" model="ir.ui.view">
+        <field name="name">purchase.order.form.vinci.bulk.preconfirm</field>
+        <field name="model">purchase.order</field>
+        <field name="inherit_id" ref="purchase.purchase_order_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//sheet" position="inside">
+                <field name="vinci_bulk_preconfirm_available" invisible="1"/>
+                <field name="vinci_bulk_purchase_route_available" invisible="1"/>
+            </xpath>
+            <xpath expr="//header" position="inside">
+                <button name="action_vinci_bulk_route" type="object" string="Toplu Rota"
+                        class="btn-secondary" groups="purchase.group_purchase_user"
+                        invisible="not vinci_bulk_preconfirm_available or not vinci_bulk_purchase_route_available"/>
+                <button name="action_vinci_bulk_tax" type="object" string="Toplu KDV"
+                        class="btn-secondary" groups="purchase.group_purchase_user"
+                        invisible="not vinci_bulk_preconfirm_available"/>
+            </xpath>
+        </field>
+    </record>
+</odoo>

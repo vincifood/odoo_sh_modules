@@ -25,6 +25,8 @@ and applicable credit notes / vendor refunds have been posted.
         "views/res_company_views.xml",
         "wizard/intercompany_order_review_wizard_views.xml",
         "views/sale_order_views.xml",
+        "wizard/bulk_document_line_wizard_views.xml",
+        "views/bulk_document_actions_views.xml",
     ],
     "installable": True,
     "application": False,
