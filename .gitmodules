@@ -19,3 +19,6 @@
 [submodule "vinci_sales_prediction"]
 	path = vinci_sales_prediction
 	url = git@github.com:vis-marin-bilisim/vinci_sales_prediction.git
+[submodule "vinci_intercompany_order_management"]
+	path = vinci_intercompany_order_management
+	url = git@github.com:onurdnz1/vinci_intercompany_order_management.git
